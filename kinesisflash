@@ -1,0 +1,191 @@
+#!/bin/python
+
+import sys
+import os
+import click
+import subprocess
+import glob
+import time
+from colorama import Fore, Back, Style, init, Cursor
+from click import echo as click_echo
+
+def echo(message=None, file=None, nl=True, err=False, color=None, carriage_return=False):
+    """
+    Patched click echo function.
+    """
+    message = message or ''
+    if carriage_return and nl:
+        click_echo(message + '\r\n', file, False, err, color)
+    elif carriage_return and not nl:
+        click_echo(message + '\r', file, False, err, color)
+    else:
+        click_echo(message, file, nl, err, color)
+
+# loading = [ '⡿', '⣟', '⣯', '⣷', '⣾', '⣽', '⣻', '⢿' ]
+loading = [ '⠟', '⠯', '⠷', '⠾', '⠽', '⠻' ]
+DIRECTORY = ''
+
+def clear_previous_lines(len, n):
+    for _ in range(n*((len-1)//os.get_terminal_size().columns+1)):
+        click.echo("\x1b[1A\x1b[1K", nl=False)
+        click.echo(" "*os.get_terminal_size().columns)
+        click.echo("\x1b[1A\x1b[1K", nl=False)
+
+def run_make():
+    try:
+        process = subprocess.Popen(["make"], cwd=DIRECTORY, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, shell=True)
+
+        count = 0
+        click.echo(f"Building firmware from source")
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            count += 1
+            click.echo("\x1b[1A\x1b[1K", nl=False)
+            echo(f"Building firmware from source {Fore.YELLOW + loading[count%len(loading)] + Style.RESET_ALL}", carriage_return=True)
+            # click.echo(count*'\b'+str(count))
+
+        process.wait()  # Wait for the subprocess to finish
+
+        if process.returncode == 0:
+            click.echo(f"{Fore.GREEN}  Build completed successfully{Style.RESET_ALL}")
+            return True
+        else:
+            click.echo(f"{Fore.RED}  Build failed with return code {process.errors}{Style.RESET_ALL}")
+            return False
+    except subprocess.CalledProcessError as e:
+        click.echo(f"{Fore.RED}  Error running 'make': {e}{Style.RESET_ALL}")
+        # Handle the error as needed
+
+def get_firmware_files():
+    files = os.listdir(f"{DIRECTORY}/firmware")
+    left_firmware_files = [f for f in files if 'left' in f and not f.startswith('.')]
+    left_firmware_file = max(left_firmware_files)
+    right_firmware_file = left_firmware_file.replace('left','right')
+    return [left_firmware_file, right_firmware_file]
+
+def mount_and_flash(device, firmware_file):
+    firmware_path = os.path.join(f"{DIRECTORY}/firmware", firmware_file)
+
+    process = subprocess.Popen([
+        f"mkdir -p ./.mnt-kinesis; " +
+        f"sudo mount {device} ./.mnt-kinesis; " +
+        f"sudo mv {firmware_path} ./.mnt-kinesis"
+    ], cwd=DIRECTORY, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, shell=True)
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            break
+        click.echo(line)
+    process.wait()  # Wait for the subprocess to finish
+    if process.returncode != 0:
+        click.echo(f"{Fore.RED}  Make command failed with return code {process.returncode}{Style.RESET_ALL}")
+        return False
+    return True
+
+
+def interactive_menu(options):
+    index = 0
+    while True:
+        for i, option in enumerate(options):
+            prefix = Fore.CYAN+("→" if i == index else " ")+Style.RESET_ALL
+            label = Fore.YELLOW+(Style.NORMAL if i == index else Style.DIM)+option+Style.RESET_ALL
+            click.echo(f" {prefix} {label}")
+
+        c = click.getchar()
+        if c == '\x0d':
+            if index < len(options):
+                for option in options:
+                    clear_previous_lines(len(option), 1)
+                return options[index]
+
+        elif c in ['\x1b[A', 'k']:  # Up arrow
+            index = (index - 1) % len(options)
+        elif c in ['\x1b[B', 'j']:  # Down arrow
+            index = (index + 1) % len(options)
+        else:
+            pass
+        for option in options:
+            clear_previous_lines(len(option), 1)
+
+def enter_to_continue(message):
+    click.echo(f" {Style.DIM + message + Style.RESET_ALL}", nl=False)
+    while True:
+        c = click.getchar()
+        if c == '\x0d':
+            click.echo(f"{Cursor.BACK(17)}{' '*17}")
+            break
+
+
+@click.command(context_settings={ "help_option_names": ['-h', '--help'] })
+@click.option("-s", is_flag=True, show_default=True, default=False, help="Skip rebuild.")
+@click.option("-d", show_default=True, default='$XDG_CONFIG_HOME/kinesis/Adv360-Pro-ZMK', help="Adv360-Pro-ZMK repository path")
+def kinesisflash(s, d):
+    global DIRECTORY
+    DIRECTORY = os.path.expandvars(d)
+    try:
+        left_devices = None
+
+        click.echo(f"{Fore.MAGENTA}Kinesis360Pro Firmware Flasher{Style.RESET_ALL}")
+        [left_firmware_file, right_firmware_file] = ["", ""]
+        if s:
+            [left_firmware_file, right_firmware_file] = get_firmware_files()
+            click.echo(
+                f"{Style.DIM}  Build skipped, using " +
+                f"{Fore.BLUE + left_firmware_file}" +
+                f"{Fore.RESET} and " +
+                f"{Fore.BLUE + right_firmware_file}" +
+                f"{Fore.RESET}{Style.RESET_ALL}"
+            )
+        else:
+            if not run_make():
+                click.echo(f"  {Fore.RED}Fix .keymap file and try again{Style.RESET_ALL}")
+                sys.exit(0)
+            [left_firmware_file, right_firmware_file] = get_firmware_files()
+
+        click.echo(f"Start the bootloader on the left module...", nl=False)
+        enter_to_continue("Enter to continue")
+        clear_previous_lines(len("Start the bootloader on the left module...")+len("Enter to continue")+1, 1)
+        while not left_devices:
+            left_devices = glob.glob('/dev/sd?')
+            if not left_devices:
+                click.echo(f"Start the bootloader on the left module...", nl=False)
+                enter_to_continue(f"{Fore.RED}No module devices available, try again{Style.RESET_ALL}")
+                clear_previous_lines(len("Start the bootloader on the left module...")+len("No module devices available, try again")+1, 1)
+
+        click.echo(f"Select bootloader drive to flash...")
+        left_device = interactive_menu(left_devices)
+        clear_previous_lines(1, 1)
+        click.echo(f"{Style.DIM}  Mounting {Fore.BLUE + left_device + Fore.RESET} and flashing {Fore.BLUE + left_firmware_file + Style.RESET_ALL}")
+        if not mount_and_flash(left_device, left_firmware_file):
+            # click.echo(f"{Fore.RED}Fix .keymap file and try again{Style.RESET_ALL}")
+            sys.exit(0)
+        click.echo(f"{Fore.GREEN}  Flashed left module successfully{Style.RESET_ALL}")
+        click.echo("Please wait for the module to disconnect...", nl=False)
+        enter_to_continue("Enter to continue")
+        click.echo(f"Start the bootloader on the right module...", nl=False)
+        enter_to_continue("Enter to continue")
+        clear_previous_lines(1, 1)
+        clear_previous_lines(1, 1)
+
+        devices = glob.glob('/dev/sd?')
+        if not devices:
+            click.echo(f"  {Fore.RED}No module detected{Style.RESET_ALL}")
+            sys.exit(0)
+
+        click.echo("Select bootloader drive to flash...")
+        right_device = interactive_menu(devices)
+        clear_previous_lines(1, 1)
+        click.echo(f"{Style.DIM}  Mounting {Fore.BLUE + right_device + Fore.RESET} and flashing {Fore.BLUE + right_firmware_file + Style.RESET_ALL}")
+        if not mount_and_flash(right_device, right_firmware_file):
+            # click.echo(f"{Fore.RED}Fix .keymap file and try again{Style.RESET_ALL}")
+            sys.exit(0)
+        click.echo(f"{Fore.GREEN}  Flashed right module successfully{Style.RESET_ALL}")
+        click.echo(f"{Style.DIM}  Wait for the module disconnect and test your config!{Style.RESET_ALL}")
+
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+if __name__ == '__main__':
+    kinesisflash()
